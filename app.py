@@ -418,7 +418,7 @@ def learn_from_history(d5, d15, side, now_iso):
 
 
 # ------------------------------------------------------------------ the analysis
-def analyse(d5, d15, vix, now, lot, weekday, nse_chain=None):
+def analyse(d5, d15, vix, now, lot, weekday, nse_chain=None, spot_override=None):
     """Judge NIFTY from completed 5m/15m candles, 60-day historical KNN memory, and live NSE Option Chain OI/PCR."""
     out = {"decision": "WAIT", "side": None, "checks": [], "reason": "", "opt": None, "plan": None, "spot": None,
            "core_pass": 0, "core_total": 0, "bonus_pass": 0, "bonus_total": 0, "bonus_need": 0}
@@ -429,7 +429,7 @@ def analyse(d5, d15, vix, now, lot, weekday, nse_chain=None):
     last_ts = d5.index[-1]
     forming = (last_ts + span) > now
     closed = d5.iloc[:-1] if forming else d5
-    spot = float(d5["Close"].iloc[-1])
+    spot = float(spot_override) if spot_override else float(d5["Close"].iloc[-1])
     out["spot"] = spot
     if len(closed) < 3:
         out["reason"] = "Not enough candles yet."
@@ -722,6 +722,25 @@ def paper_stats(closed):
 # ---- LOGIC END
 
 
+# ------------------------------------------------------------------ live NIFTY price
+def live_spot(d5, df1, nse_chain, now):
+    """Best available NIFTY price, with its source and age in minutes.
+    Priority: NSE feed (if under 3 min old) > latest 1-minute Yahoo bar > latest 5-minute bar."""
+    if nse_chain and nse_chain.get("spot", 0) > 0:
+        try:
+            ts = IST.localize(dt.datetime.strptime(nse_chain["timestamp"], "%d-%b-%Y %H:%M:%S"))
+            age = (now - ts).total_seconds() / 60
+            if -1 <= age <= 3:
+                return float(nse_chain["spot"]), "NSE live", age
+        except Exception:
+            pass
+    if df1 is not None and len(df1):
+        ts = df1.index[-1]
+        return float(df1["Close"].iloc[-1]), "Yahoo 1m", (now - ts).total_seconds() / 60 - 1
+    ts = d5.index[-1]
+    return float(d5["Close"].iloc[-1]), "Yahoo 5m", (now - ts).total_seconds() / 60 - 5
+
+
 # ------------------------------------------------------------------ data
 def _clean(df):
     if isinstance(df.columns, pd.MultiIndex):
@@ -906,7 +925,7 @@ def trade_view(lot, weekday):
         raw5 = load_prices(TICKER, "5m", "60d")
         raw15 = load_prices(TICKER, "15m", "60d")
         # Fetch 1-minute candles when a position is open for 5x sharper stop/target resolution
-        raw1 = load_prices(TICKER, "1m", "5d") if acct["positions"] else pd.DataFrame()
+        raw1 = load_prices(TICKER, "1m", "5d")
     except Exception as e:
         st.error(f"Could not fetch NIFTY data from Yahoo Finance: {e}")
         return
@@ -919,12 +938,20 @@ def trade_view(lot, weekday):
     vix = load_vix()
     nse_chain = fetch_nse_chain()
 
-    spot = float(d5["Close"].iloc[-1])
+    spot, spot_src, spot_age = live_spot(d5, raw1, nse_chain, now)
     badge = {"open": "🟢 Market open", "square_off": "🟠 Square-off time", "closed": "⚪ Market closed"}[state]
     nse_badge = (f"🟢 NSE Chain Live (PCR {nse_chain['pcr']:.2f})"
                  if (nse_chain and nse_chain.get("pcr")) else "🟡 Option Model Fallback")
-    st.caption(f"{badge} · {nse_badge} · NIFTY {num(spot, 2)} · last 5m bar {d5.index[-1]:%d %b %H:%M} IST · "
+    st.caption(f"{badge} · {nse_badge} · NIFTY {num(spot, 2)} ({spot_src}, {max(spot_age, 0):.0f} min old) · last 5m bar {d5.index[-1]:%d %b %H:%M} IST · "
                f"India VIX {('%.1f' % vix) if vix else 'n/a'}")
+
+    if state != "closed" and spot_age > 3:
+        st.warning(f"⚠️ NIFTY price is {spot_age:.0f} min old (Yahoo is delayed). Compare with your broker before acting.")
+    if state == "closed":
+        st.caption("Market closed: price shown is the last Yahoo candle, which can differ from NSE's official close by 10 to 15 points.")
+    if not (nse_chain and nse_chain.get("pcr")):
+        st.info("Option prices are **model estimates** because the NSE feed is blocked from this server. They can differ from the real "
+                "premium by ₹10 to 15. Always type the real price from your broker in the override box.")
 
     # ---------- a paper trade is open: show only that trade
     if acct["positions"]:
@@ -1004,7 +1031,7 @@ def trade_view(lot, weekday):
     if state == "square_off":
         st.warning("It is past 3:15 PM IST. No new trades today.")
         return
-    res = analyse(d5, d15, vix, now, lot, weekday, nse_chain=nse_chain)
+    res = analyse(d5, d15, vix, now, lot, weekday, nse_chain=nse_chain, spot_override=spot)
     if acct["closed"]:
         t = acct["closed"][-1]
         st.caption(f"Last paper trade: {t['label']}, {t['reason']}, {inr(t['pnl'])}.")
